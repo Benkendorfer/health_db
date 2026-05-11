@@ -1,0 +1,10 @@
+repos:
+  - repo: local
+    hooks:
+      - id: check-schema-docs
+        name: README Schema section in sync with sql/
+        entry: python src/check_schema_docs.py
+        language: system
+        pass_filenames: false
+        # Only run when SQL or the README could have caused drift.
+        files: ^(sql/.*\.sql|README\.md)$

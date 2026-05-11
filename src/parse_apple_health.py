@@ -9,55 +9,75 @@ from typing import Iterator
 
 from lxml import etree  # type: ignore[attr-defined]
 
-ACTIVE_ENERGY_TYPE = "HKQuantityTypeIdentifierActiveEnergyBurned"
 SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 
+# Apple Health type identifier -> short name stored in records.record_type.
+# Extend this dict to ingest more quantity metrics (BodyMass, HeartRate, etc).
+QUANTITY_TYPES: dict[str, str] = {
+    "HKQuantityTypeIdentifierActiveEnergyBurned": "ActiveEnergyBurned",
+    "HKQuantityTypeIdentifierBodyMass": "BodyMass"
+}
 
-def iter_records(xml_path: Path, record_type: str | None = None) -> Iterator[dict]:
+
+def iter_records(
+    xml_path: Path, record_types: set[str] | None = None
+) -> Iterator[dict]:
     """Stream <Record> elements from an Apple Health export.
 
-    If record_type is given, only records whose `type` attribute matches are yielded.
-    Uses iterparse with element clearing so memory stays flat on multi-GB exports.
+    If record_types is given, only records whose `type` attribute is in the
+    set are yielded. Uses iterparse with element clearing so memory stays
+    flat on multi-GB exports.
     """
     context = etree.iterparse(str(xml_path), events=("end",), tag="Record")
     for _, elem in context:
-        if record_type is None or elem.attrib.get("type") == record_type:
+        if record_types is None or elem.attrib.get("type") in record_types:
             yield dict(elem.attrib)
         elem.clear()
         while elem.getprevious() is not None:
             del elem.getparent()[0]
 
 
-def load_active_energy(
+def load_records(
     xml_path: Path, db_path: Path, batch_size: int = 10_000
-) -> tuple[int, int]:
-    """Ingest ActiveEnergyBurned records idempotently. Returns (seen, inserted)."""
+) -> tuple[int, int, int]:
+    """Ingest all configured quantity records idempotently.
+
+    Returns (seen, inserted, skipped_malformed). Records with a missing or
+    non-numeric `value` are counted and skipped rather than aborting the run.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     schema_sql = (SQL_DIR / "schema.sql").read_text()
     views_sql = (SQL_DIR / "views.sql").read_text()
-    insert_sql = (SQL_DIR / "insert_active_energy.sql").read_text()
+    insert_sql = (SQL_DIR / "insert_record.sql").read_text()
 
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(schema_sql)
         conn.executescript(views_sql)
-        before = conn.execute("SELECT COUNT(*) FROM active_energy").fetchone()[0]
+        before = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
 
         batch: list[tuple] = []
         seen = 0
-        for rec in iter_records(xml_path, ACTIVE_ENERGY_TYPE):
+        malformed = 0
+        for rec in iter_records(xml_path, set(QUANTITY_TYPES)):
+            seen += 1
+            try:
+                value = float(rec["value"])
+            except (KeyError, ValueError):
+                malformed += 1
+                continue
             batch.append(
                 (
+                    QUANTITY_TYPES[rec["type"]],
                     rec.get("sourceName"),
                     rec.get("startDate"),
                     rec.get("endDate"),
-                    float(rec["value"]),
+                    value,
                     rec.get("unit"),
                     rec.get("sourceVersion"),
                     rec.get("creationDate"),
                 )
             )
-            seen += 1
             if len(batch) >= batch_size:
                 conn.executemany(insert_sql, batch)
                 batch.clear()
@@ -65,8 +85,8 @@ def load_active_energy(
             conn.executemany(insert_sql, batch)
 
         conn.commit()
-        after = conn.execute("SELECT COUNT(*) FROM active_energy").fetchone()[0]
-        return seen, after - before
+        after = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        return seen, after - before, malformed
     finally:
         conn.close()
 
@@ -77,11 +97,13 @@ def main() -> None:
     parser.add_argument("db_path", type=Path, help="Path to SQLite database to write")
     args = parser.parse_args()
 
-    seen, inserted = load_active_energy(args.xml_path, args.db_path)
-    skipped = seen - inserted
+    seen, inserted, malformed = load_records(args.xml_path, args.db_path)
+    duplicates = seen - inserted - malformed
     print(
-        f"Saw {seen:,} active-energy records; "
-        f"inserted {inserted:,} new, skipped {skipped:,} already present."
+        f"Saw {seen:,} records; "
+        f"inserted {inserted:,} new, "
+        f"skipped {duplicates:,} already present, "
+        f"skipped {malformed:,} malformed."
     )
 
 
