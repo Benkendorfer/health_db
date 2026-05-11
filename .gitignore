@@ -4,6 +4,8 @@ data/
 *.csv
 *.ofx
 .env
+config.toml
 .DS_store
 .vscode/
 .claude/
+__pycache__/

@@ -46,4 +46,8 @@ VALUES
     -- so they appear only on days no scale reported.
     ('BodyMass',           'eufy Life',     0),
     ('BodyMass',           'Connect',       1),
-    ('BodyMass',           'Health',       10);
+    ('BodyMass',           'Health',       10),
+    -- Garmin Connect wins
+    ('BasalEnergyBurned',  'Connect',       0),
+    -- MyFitnessPal wins
+    ('CaloriesConsumed',   'MyFitnessPal',  0);

@@ -1,0 +1,8 @@
+# Personal config for the health_db analyses.
+# Copy this file to `config.toml` and fill in your own values.
+# `config.toml` is gitignored, so your real numbers stay local.
+
+[subject]
+height_cm = 180
+age_yr    = 30
+sex       = "m"   # "m" or "f" — selects the Mifflin-St Jeor offset.

@@ -6,6 +6,7 @@ Quick repo to run analyses over data collected with Apple Health. Uses an SQLite
   - [Layout](#layout)
   - [Schema](#schema)
   - [Setup](#setup)
+  - [Personal config](#personal-config)
   - [Ingesting an export](#ingesting-an-export)
 
 ## Layout
@@ -68,6 +69,25 @@ pre-commit install
 ```
 
 The same check runs in GitHub Actions on push and pull request (see `.github/workflows/checks.yml`).
+
+## Personal config
+
+Analyses that need subject-specific constants (height, age, sex — used by the Mifflin-St Jeor BMR estimate in `src/analyze.py`) read them from a gitignored `config.toml`. Copy the template and fill in your own values:
+
+```bash
+cp config.example.toml config.toml
+```
+
+Then edit `config.toml`:
+
+```toml
+[subject]
+height_cm = 180
+age_yr    = 30
+sex       = "m"   # "m" or "f"
+```
+
+`config.toml` is gitignored, so your numbers stay local. `analyze.py` will exit with a pointer to this step if the file is missing.
 
 ## Ingesting an export
 

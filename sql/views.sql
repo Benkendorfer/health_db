@@ -18,8 +18,12 @@
 -- Drop in reverse dependency order, then recreate forward.
 DROP VIEW IF EXISTS daily_body_mass_canonical;
 DROP VIEW IF EXISTS daily_active_energy_canonical;
+DROP VIEW IF EXISTS daily_basal_energy_canonical;
+DROP VIEW IF EXISTS daily_calories_consumed_canonical;
 DROP VIEW IF EXISTS body_mass_canonical;
 DROP VIEW IF EXISTS active_energy_canonical;
+DROP VIEW IF EXISTS basal_energy_canonical;
+DROP VIEW IF EXISTS calories_consumed_canonical;
 DROP VIEW IF EXISTS records_canonical;
 
 CREATE VIEW records_canonical AS
@@ -60,6 +64,26 @@ WHERE record_type = 'BodyMass';
 CREATE VIEW daily_active_energy_canonical AS
 SELECT SUBSTR(start_date, 1, 10) AS day, SUM(value) AS kcal
 FROM active_energy_canonical
+GROUP BY day;
+
+CREATE VIEW basal_energy_canonical AS
+SELECT source_name, start_date, end_date, value, unit, source_version, creation_date
+FROM records_canonical
+WHERE record_type = 'BasalEnergyBurned';
+
+CREATE VIEW daily_basal_energy_canonical AS
+SELECT SUBSTR(start_date, 1, 10) AS day, SUM(value) AS kcal
+FROM basal_energy_canonical
+GROUP BY day;
+
+CREATE VIEW calories_consumed_canonical AS
+SELECT source_name, start_date, end_date, value, unit, source_version, creation_date
+FROM records_canonical
+WHERE record_type = 'CaloriesConsumed';
+
+CREATE VIEW daily_calories_consumed_canonical AS
+SELECT SUBSTR(start_date, 1, 10) AS day, SUM(value) AS kcal
+FROM calories_consumed_canonical
 GROUP BY day;
 
 -- Median emulation for SQLite < 3.44. For each day, number the readings by

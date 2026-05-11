@@ -15,7 +15,9 @@ SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 # Extend this dict to ingest more quantity metrics (BodyMass, HeartRate, etc).
 QUANTITY_TYPES: dict[str, str] = {
     "HKQuantityTypeIdentifierActiveEnergyBurned": "ActiveEnergyBurned",
-    "HKQuantityTypeIdentifierBodyMass": "BodyMass"
+    "HKQuantityTypeIdentifierBodyMass": "BodyMass",
+    "HKQuantityTypeIdentifierBasalEnergyBurned": "BasalEnergyBurned",
+    "HKQuantityTypeIdentifierDietaryEnergyConsumed": "CaloriesConsumed"
 }
 
 
