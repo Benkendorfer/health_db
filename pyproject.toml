@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=3.0",
     "pillow>=12.2",
     "scipy>=1.17",
+    "seaborn>=0.13",
 ]
 
 [build-system]

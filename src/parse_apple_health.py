@@ -10,6 +10,7 @@ from typing import Iterator
 from lxml import etree  # type: ignore[attr-defined]
 
 ACTIVE_ENERGY_TYPE = "HKQuantityTypeIdentifierActiveEnergyBurned"
+SQL_DIR = Path(__file__).resolve().parent.parent / "sql"
 
 
 def iter_records(xml_path: Path, record_type: str | None = None) -> Iterator[dict]:
@@ -27,56 +28,45 @@ def iter_records(xml_path: Path, record_type: str | None = None) -> Iterator[dic
             del elem.getparent()[0]
 
 
-def load_active_energy(xml_path: Path, db_path: Path, batch_size: int = 10_000) -> int:
-    """Extract ActiveEnergyBurned records into a SQLite table. Returns row count."""
+def load_active_energy(
+    xml_path: Path, db_path: Path, batch_size: int = 10_000
+) -> tuple[int, int]:
+    """Ingest ActiveEnergyBurned records idempotently. Returns (seen, inserted)."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    schema_sql = (SQL_DIR / "schema.sql").read_text()
+    views_sql = (SQL_DIR / "views.sql").read_text()
+    insert_sql = (SQL_DIR / "insert_active_energy.sql").read_text()
+
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("DROP TABLE IF EXISTS active_energy")
-        conn.execute(
-            """
-            CREATE TABLE active_energy (
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                value REAL NOT NULL,
-                unit TEXT NOT NULL,
-                source_name TEXT,
-                source_version TEXT,
-                creation_date TEXT
-            )
-            """
-        )
-        insert_sql = (
-            "INSERT INTO active_energy "
-            "(start_date, end_date, value, unit, source_name, source_version, creation_date) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
+        conn.executescript(schema_sql)
+        conn.executescript(views_sql)
+        before = conn.execute("SELECT COUNT(*) FROM active_energy").fetchone()[0]
 
         batch: list[tuple] = []
-        total = 0
+        seen = 0
         for rec in iter_records(xml_path, ACTIVE_ENERGY_TYPE):
             batch.append(
                 (
+                    rec.get("sourceName"),
                     rec.get("startDate"),
                     rec.get("endDate"),
                     float(rec["value"]),
                     rec.get("unit"),
-                    rec.get("sourceName"),
                     rec.get("sourceVersion"),
                     rec.get("creationDate"),
                 )
             )
+            seen += 1
             if len(batch) >= batch_size:
                 conn.executemany(insert_sql, batch)
-                total += len(batch)
                 batch.clear()
         if batch:
             conn.executemany(insert_sql, batch)
-            total += len(batch)
 
-        conn.execute("CREATE INDEX idx_active_energy_start ON active_energy(start_date)")
         conn.commit()
-        return total
+        after = conn.execute("SELECT COUNT(*) FROM active_energy").fetchone()[0]
+        return seen, after - before
     finally:
         conn.close()
 
@@ -87,8 +77,12 @@ def main() -> None:
     parser.add_argument("db_path", type=Path, help="Path to SQLite database to write")
     args = parser.parse_args()
 
-    n = load_active_energy(args.xml_path, args.db_path)
-    print(f"Inserted {n:,} active energy records into {args.db_path}")
+    seen, inserted = load_active_energy(args.xml_path, args.db_path)
+    skipped = seen - inserted
+    print(
+        f"Saw {seen:,} active-energy records; "
+        f"inserted {inserted:,} new, skipped {skipped:,} already present."
+    )
 
 
 if __name__ == "__main__":

@@ -6,3 +6,4 @@ data/
 .env
 .DS_store
 .vscode/
+.claude/
