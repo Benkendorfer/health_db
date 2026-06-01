@@ -317,7 +317,19 @@ def plot_intake_weight_correlations(
     # Predictors for fit_unlogged_intake (surplus convention):
     #   A = cumulative known surplus, counting unlogged-day intake as 0
     #   B = running count of unlogged days
-    expenditure = filtered["basal_msj"] + filtered["active"]
+    # `active` comes from a calendar-day reindex, so a day with no active-energy
+    # record is NaN. cumsum propagates NaN, which would turn A into NaN from the
+    # first gap onward and silently drop the entire tail of the series in the
+    # fit's dropna. Zero-fill instead: a day with no recorded active energy is
+    # treated as zero active expenditure (the conservative reading of a missing
+    # record), keeping the cumulative sum intact (#9). Surface any such gaps so
+    # the imputation is visible rather than silent.
+    active_gaps = filtered["active"].isna()
+    if active_gaps.any():
+        print(f"Warning: {int(active_gaps.sum())} in-range day(s) lack an "
+              "active-energy record; treating as 0 active kcal for the "
+              "cumulative surplus (#9).")
+    expenditure = filtered["basal_msj"] + filtered["active"].fillna(0.0)
     filtered["A"] = (filtered["intake"].fillna(0.0) - expenditure).cumsum()
     filtered["B"] = (~intake_logged).astype(float).cumsum()
 
