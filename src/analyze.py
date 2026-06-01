@@ -11,9 +11,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+import statsmodels.api as sm
 from matplotlib.axes import Axes
 from matplotlib.colors import ListedColormap
-from scipy import stats
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / \
     "data" / "db" / "health.db"
@@ -125,18 +125,20 @@ def diagnose_missing_data(df: pd.DataFrame) -> None:
     # plt.show()
 
 
-def impute_energy(df: pd.DataFrame) -> None:
-    print("Diagnostics before imputation:")
+def prepare_energy_frame(df: pd.DataFrame) -> None:
+    """Interpolate weight in place; leave unlogged intake missing.
+
+    Weight is needed on every day to compute basal expenditure, so its gaps are
+    filled by time interpolation. Intake is deliberately *not* imputed: unlogged
+    days are modeled in the fit (see `fit_unlogged_intake`) rather than assumed
+    equal to maintenance, which would force their energy balance to zero.
+    """
+    print("Diagnostics before interpolation:")
     diagnose_missing_data(df)
 
     df["weight"] = df["weight"].interpolate(method="time")
-    # df["intake"] = df["intake"].fillna(df["intake"].mean())
 
-    basal = bmr_mifflin_st_jeor(df["weight"], HEIGHT_CM, AGE_YR, SEX)
-    maintenance = basal + df["active"]
-    df["intake"] = df["intake"].fillna(maintenance)
-
-    print("\n Diagnostics after imputation:")
+    print("\n Diagnostics after interpolation:")
     diagnose_missing_data(df)
 
 
@@ -149,6 +151,53 @@ def bmr_mifflin_st_jeor(
     """Mifflin-St Jeor basal metabolic rate, kcal/day. Vectorizes over a Series."""
     offset = 5 if sex.lower().startswith("m") else -161
     return 10.0 * weight_kg + 6.25 * height_cm - 5.0 * age_yr + offset
+
+
+def fit_unlogged_intake(df: pd.DataFrame) -> dict:
+    """Fit weight ~ cumulative surplus, estimating mean intake on unlogged days.
+
+    Daily energy surplus is intake - expenditure. On logged days it is known; on
+    unlogged days intake is an unknown constant mu, so the cumulative surplus
+    through day t splits into a known part A_t (unlogged intake counted as 0) plus
+    mu times B_t, the running count of unlogged days:
+
+        weight_t ~ w0 + k*A_t + (k*mu)*B_t
+
+    Regressing weight on A and B therefore identifies k (kg per kcal) and
+    mu = coef_B / coef_A, the implied average intake on unlogged days. This
+    replaces the old assumption that unlogged days sat exactly at maintenance.
+
+    Expects columns `weight`, `A`, `B`. Returns the fitted model plus k, mu, and
+    a delta-method standard error for mu. Rows with any NaN are dropped, so
+    `n_obs` flags how many days actually entered the fit.
+
+    Standard errors use a Newey-West (HAC) covariance: the predictors are
+    cumulative sums and weight is interpolated, so residuals are strongly
+    autocorrelated and classical OLS errors would be far too small. The lag
+    length follows the usual 4*(n/100)^(2/9) rule of thumb.
+    """
+    fit_df = df[["weight", "A", "B"]].dropna()
+    max_lags = int(4.0 * (len(fit_df) / 100.0) ** (2.0 / 9.0))
+    model = sm.OLS(fit_df["weight"], sm.add_constant(fit_df[["A", "B"]])).fit(
+        cov_type="HAC", cov_kwds={"maxlags": max_lags})
+
+    k, coef_b = model.params["A"], model.params["B"]
+    mu = coef_b / k
+
+    # Delta method for the ratio mu = coef_B / coef_A.
+    cov = model.cov_params()
+    var_mu = (
+        cov.loc["B", "B"] / k**2
+        + coef_b**2 * cov.loc["A", "A"] / k**4
+        - 2.0 * coef_b * cov.loc["A", "B"] / k**3
+    )
+    return {
+        "model": model,
+        "k": k,
+        "mu": mu,
+        "se_mu": float(var_mu) ** 0.5,
+        "n_obs": int(model.nobs),
+    }
 
 
 def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> None:
@@ -180,59 +229,68 @@ def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> N
     ax.set_title("Distribution of daily calorie intake")
     # plt.show()
 
-    # Filter to first day
+    # Filter to first day. Capture which days have a real log *before* touching
+    # the frame -- the indicator drives the unlogged-intake fit below.
     filtered = base_df.loc[base_df.index >= first_day].copy()
-    impute_energy(filtered)
+    intake_logged = filtered["intake"].notna()
+    prepare_energy_frame(filtered)
     filtered["basal_msj"] = bmr_mifflin_st_jeor(
         filtered["weight"], HEIGHT_CM, AGE_YR, SEX)
 
-    # Compute cumulative sum to compare against weight
-    filtered["energy_excess"] = filtered["intake"] - \
-        filtered["basal_msj"] - filtered["active"]
-    filtered["cumulative_excess"] = filtered["energy_excess"].cumsum()
+    # Predictors for fit_unlogged_intake (surplus convention):
+    #   A = cumulative known surplus, counting unlogged-day intake as 0
+    #   B = running count of unlogged days
+    expenditure = filtered["basal_msj"] + filtered["active"]
+    filtered["A"] = (filtered["intake"].fillna(0.0) - expenditure).cumsum()
+    filtered["B"] = (~intake_logged).astype(float).cumsum()
 
-    print(f"Mean excess per day: {filtered["energy_excess"].mean():.2f} kcal")
+    fit = fit_unlogged_intake(filtered)
+    model, k, mu, se_mu = fit["model"], fit["k"], fit["mu"], fit["se_mu"]
+    logged_mean = base_df["intake"].dropna().mean()
 
+    print(f"Days: {int(intake_logged.sum())} logged, "
+          f"{int((~intake_logged).sum())} unlogged "
+          f"({fit['n_obs']} entered the fit)")
     print(f"Mean basal:  {filtered['basal'].mean():.0f} kcal/day")
     print(f"Mean MSJ basal:  {filtered['basal_msj'].mean():.0f} kcal/day")
     print(f"Mean active: {filtered['active'].mean():.0f} kcal/day")
-    print(
-        f"Mean total expenditure: {(filtered['basal']+filtered['active']).mean():.0f} kcal/day")
-    print(
-        f"Mean total expenditure (MSJ basal): {(filtered['basal_msj']+filtered['active']).mean():.0f} kcal/day")
-    print(
-        f"Mean logged intake: {base_df['intake'].dropna().mean():.0f} kcal/day")
+    print(f"Mean logged intake:   {logged_mean:.0f} kcal/day")
+    print(f"Est. unlogged intake: {mu:.0f} +/- {se_mu:.0f} kcal/day")
+    print(f"Energy per kg: {1.0 / k:.0f} kcal/kg (R^2 = {model.rsquared:.3f})")
 
-    # Compare the cumulative sum to weight
-    fit_df = filtered[["cumulative_excess", "weight"]].dropna()
-    # type: ignore[arg-type]
-    fit = stats.linregress(fit_df["cumulative_excess"], fit_df["weight"])
+    # Plot weight against the fitted cumulative surplus (A + mu*B): by
+    # construction the model is weight ~ const + k*(A + mu*B), so the fitted
+    # line has intercept `const` and slope `k`.
+    filtered["cumulative_surplus"] = filtered["A"] + mu * filtered["B"]
     label = (
-        # type: ignore[attr-defined]
-        f"slope = {fit.slope:.2e} kg/kcal ({1.0/fit.slope:.1f} kcal/kg)\n"
-        f"intercept = {fit.intercept:.2f} kg\n"  # type: ignore[attr-defined]
-        f"R² = {fit.rvalue ** 2:.3f}"  # type: ignore[attr-defined]
+        f"{1.0 / k:.0f} kcal/kg  (k = {k:.2e} kg/kcal)\n"
+        f"unlogged intake = {mu:.0f} +/- {se_mu:.0f} kcal/day\n"
+        f"R² = {model.rsquared:.3f}"
     )
 
     _, ax = plt.subplots(figsize=(8, 6))
     sns.scatterplot(
         data=filtered,
-        x="cumulative_excess",
+        x="cumulative_surplus",
         y="weight",
         ax=ax,
         alpha=0.5,
         s=12,
     )
     ax.axline(
-        (0, fit.intercept),  # type: ignore[attr-defined]
-        slope=fit.slope,  # type: ignore[attr-defined]
+        (0, model.params["const"]),
+        slope=k,
         color="tab:orange",
         linewidth=1.5,
         label=label,
     )
-    ax.set_xlabel("Cumulative deficit (kcal)")
+    ax.set_xlabel("Cumulative energy surplus (kcal)")
     ax.set_ylabel("Body mass (kg)")
     ax.legend(frameon=False, loc="best")
+
+
+def plot_active_intake_correlations(db_path) -> None:
+    pass
 
 
 def main() -> None:
@@ -277,6 +335,7 @@ def main() -> None:
         pass
 
     plot_intake_weight_correlations(args.db)
+    plot_active_intake_correlations(args.db)
 
     plt.show()
 
