@@ -173,11 +173,15 @@ def fit_unlogged_intake(df: pd.DataFrame) -> dict:
 
     Standard errors use a Newey-West (HAC) covariance: the predictors are
     cumulative sums and weight is interpolated, so residuals are strongly
-    autocorrelated and classical OLS errors would be far too small. The lag
-    length follows the usual 4*(n/100)^(2/9) rule of thumb.
+    autocorrelated and classical OLS errors would be far too small. The
+    standard 4*(n/100)^(2/9) rule yields too short a bandwidth here (~4 days),
+    well before the SE stabilizes, so we floor it at 30 days. This is a stopgap:
+    because the regressors are non-stationary cumulative sums, even HAC errors
+    are not fully trustworthy -- a first-difference reformulation (#13) is the
+    real fix.
     """
     fit_df = df[["weight", "A", "B"]].dropna()
-    max_lags = int(4.0 * (len(fit_df) / 100.0) ** (2.0 / 9.0))
+    max_lags = max(30, int(4.0 * (len(fit_df) / 100.0) ** (2.0 / 9.0)))
     model = sm.OLS(fit_df["weight"], sm.add_constant(fit_df[["A", "B"]])).fit(
         cov_type="HAC", cov_kwds={"maxlags": max_lags})
 
