@@ -204,6 +204,67 @@ def fit_unlogged_intake(df: pd.DataFrame) -> dict:
     }
 
 
+def fit_unlogged_intake_differenced(df: pd.DataFrame, period_days: int = 7) -> dict:
+    """Block-difference counterpart to `fit_unlogged_intake`.
+
+    Differencing the levels model weight_t ~ w0 + k*A_t + (k*mu)*B_t gives a
+    regression of weight *change* on energy balance, with the same identity
+    mu = coef_dB / coef_dA. The win over the levels fit is that the differenced
+    regressors are stationary, escaping its cointegration/spurious-regression
+    regime so the standard errors are genuinely valid (#13).
+
+    The catch is signal-to-noise: a single day's fat change (~surplus/7700 kg)
+    is dwarfed by day-to-day water-weight swings, so a *daily* difference is pure
+    noise (and even flips the sign of k). We therefore aggregate to
+    non-overlapping `period_days` blocks -- accumulated surplus over a block
+    rises above the noise floor -- and smooth weight with a centered rolling mean
+    first to further damp measurement noise:
+
+        dW_i ~ c + k*dA_i + (k*mu)*dB_i      (i indexes blocks)
+
+    dA_i is the block's net known surplus (A differenced across the block) and
+    dB_i its count of unlogged days. Non-overlapping blocks make the residuals
+    roughly independent; a small HAC bandwidth absorbs the mild autocorrelation
+    the centered smoothing leaks across block boundaries.
+
+    Expects columns `weight`, `A`, `B` on a daily DatetimeIndex. Returns the
+    model, k, mu, a delta-method SE for mu, n_obs, and the block-level frame.
+
+    NOTE: weight is still interpolated (#10); smoothing + block aggregation
+    blunts but does not remove that contamination.
+    """
+    smooth = df["weight"].rolling(period_days, center=True, min_periods=1).mean()
+    blocks = pd.DataFrame(
+        {"weight": smooth, "A": df["A"], "B": df["B"]}
+    ).resample(f"{period_days}D").last()
+    d = pd.DataFrame({
+        "dW": blocks["weight"].diff(),
+        "dA": blocks["A"].diff(),
+        "dB": blocks["B"].diff(),
+    }).dropna()
+    model = sm.OLS(d["dW"], sm.add_constant(d[["dA", "dB"]])).fit(
+        cov_type="HAC", cov_kwds={"maxlags": 1})
+
+    k, coef_b = model.params["dA"], model.params["dB"]
+    mu = coef_b / k
+
+    # Delta method for the ratio mu = coef_dB / coef_dA.
+    cov = model.cov_params()
+    var_mu = (
+        cov.loc["dB", "dB"] / k**2
+        + coef_b**2 * cov.loc["dA", "dA"] / k**4
+        - 2.0 * coef_b * cov.loc["dA", "dB"] / k**3
+    )
+    return {
+        "model": model,
+        "k": k,
+        "mu": mu,
+        "se_mu": float(var_mu) ** 0.5,
+        "n_obs": int(model.nobs),
+        "frame": d,
+    }
+
+
 def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> None:
     sns.set_theme(style="whitegrid")
 
@@ -250,6 +311,7 @@ def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> N
 
     fit = fit_unlogged_intake(filtered)
     model, k, mu, se_mu = fit["model"], fit["k"], fit["mu"], fit["se_mu"]
+    diff_fit = fit_unlogged_intake_differenced(filtered)
     logged_mean = base_df["intake"].dropna().mean()
 
     print(f"Days: {int(intake_logged.sum())} logged, "
@@ -259,8 +321,13 @@ def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> N
     print(f"Mean MSJ basal:  {filtered['basal_msj'].mean():.0f} kcal/day")
     print(f"Mean active: {filtered['active'].mean():.0f} kcal/day")
     print(f"Mean logged intake:   {logged_mean:.0f} kcal/day")
-    print(f"Est. unlogged intake: {mu:.0f} +/- {se_mu:.0f} kcal/day")
-    print(f"Energy per kg: {1.0 / k:.0f} kcal/kg (R^2 = {model.rsquared:.3f})")
+
+    # Compare the levels fit (non-stationary, HAC a stopgap) against the
+    # differenced fit (stationary, valid inference). See #13.
+    print("\n                        unlogged intake      energy/kg     R^2")
+    for name, f in (("levels    ", fit), ("differenced", diff_fit)):
+        print(f"  {name}   {f['mu']:>7.0f} +/- {f['se_mu']:<5.0f} kcal/day"
+              f"   {1.0 / f['k']:>6.0f} kcal/kg   {f['model'].rsquared:.3f}")
 
     # Plot weight against the fitted cumulative surplus (A + mu*B): by
     # construction the model is weight ~ const + k*(A + mu*B), so the fitted
@@ -290,6 +357,30 @@ def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> N
     )
     ax.set_xlabel("Cumulative energy surplus (kcal)")
     ax.set_ylabel("Body mass (kg)")
+    ax.legend(frameon=False, loc="best")
+
+    # Differenced view: per-block weight change vs the fitted block balance
+    # (dA + mu*dB). Fitted line has intercept `const` and slope `k`.
+    d_k, d_mu, d_se = diff_fit["k"], diff_fit["mu"], diff_fit["se_mu"]
+    diff_df = diff_fit["frame"].assign(
+        balance=lambda r: r["dA"] + d_mu * r["dB"])
+    d_label = (
+        f"{1.0 / d_k:.0f} kcal/kg  (k = {d_k:.2e} kg/kcal)\n"
+        f"unlogged intake = {d_mu:.0f} +/- {d_se:.0f} kcal/day\n"
+        f"R² = {diff_fit['model'].rsquared:.3f}"
+    )
+
+    _, ax = plt.subplots(figsize=(8, 6))
+    sns.scatterplot(data=diff_df, x="balance", y="dW", ax=ax, alpha=0.6, s=24)
+    ax.axline(
+        (0, diff_fit["model"].params["const"]),
+        slope=d_k,
+        color="tab:orange",
+        linewidth=1.5,
+        label=d_label,
+    )
+    ax.set_xlabel("Block energy balance (kcal)")
+    ax.set_ylabel("Block body-mass change (kg)")
     ax.legend(frameon=False, loc="best")
 
 
