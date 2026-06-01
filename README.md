@@ -48,11 +48,15 @@ Views compose top-down:
 
 ```txt
 records
-  └─ records_canonical              (filters to preferred source per type+day)
-       ├─ active_energy_canonical   (record_type = 'ActiveEnergyBurned')
-       │    └─ daily_active_energy_canonical   (SUM value per day -> kcal)
-       └─ body_mass_canonical       (record_type = 'BodyMass')
-            └─ daily_body_mass_canonical       (AVG value per day -> kg)
+  └─ records_canonical                   (filters to preferred source per type+day)
+       ├─ active_energy_canonical        (record_type = 'ActiveEnergyBurned')
+       │    └─ daily_active_energy_canonical        (SUM value per day -> kcal)
+       ├─ basal_energy_canonical         (record_type = 'BasalEnergyBurned')
+       │    └─ daily_basal_energy_canonical         (SUM value per day -> kcal)
+       ├─ body_mass_canonical            (record_type = 'BodyMass')
+       │    └─ daily_body_mass_canonical            (MEDIAN value per day -> kg)
+       └─ calories_consumed_canonical    (record_type = 'CaloriesConsumed')
+            └─ daily_calories_consumed_canonical    (SUM value per day -> kcal)
 ```
 
 Analysis scripts should query the `daily_<type>_canonical` views rather than re-deriving the priority/rollup logic.
