@@ -1,10 +1,13 @@
 -- Views over the records table.
 --
 -- records_canonical: deduplicates across sources at (record_type, day)
--- granularity. For each (type, day), keep rows from the source(s) with the
--- lowest priority value in source_priority. Sources missing from
--- source_priority are treated as worst-priority fallbacks, so they appear
--- only on days no ranked source reported.
+-- granularity. For each (type, day), pick exactly ONE winning source --
+-- ranked by (priority, source_name) so ties break deterministically and
+-- alphabetically -- then keep ALL of that source's rows for the day (a single
+-- source may legitimately have multiple sub-daily samples that downstream
+-- aggregations sum or median). Sources missing from source_priority are
+-- treated as worst-priority fallbacks, so they win only on days no ranked
+-- source reported.
 --
 -- <type>_canonical: thin per-type filters over records_canonical, kept for
 -- readability when querying a single metric.
@@ -37,19 +40,24 @@ WITH ranked AS (
         ON sp.source_name = r.source_name
        AND sp.record_type = r.record_type
 ),
-day_min AS (
-    SELECT record_type, day, MIN(priority) AS min_priority
-    FROM ranked
-    GROUP BY record_type, day
+winner AS (
+    -- One winning source per (type, day): lowest priority, then alphabetical.
+    SELECT record_type, day, source_name,
+           ROW_NUMBER() OVER (
+               PARTITION BY record_type, day
+               ORDER BY priority, source_name
+           ) AS srank
+    FROM (SELECT DISTINCT record_type, day, source_name, priority FROM ranked)
 )
 SELECT
     r.id, r.record_type, r.source_name, r.start_date, r.end_date,
     r.value, r.unit, r.source_version, r.creation_date
 FROM ranked AS r
-JOIN day_min AS dm
-    ON dm.record_type = r.record_type
-   AND dm.day = r.day
-   AND dm.min_priority = r.priority;
+JOIN winner AS w
+    ON w.record_type = r.record_type
+   AND w.day = r.day
+   AND w.source_name = r.source_name
+   AND w.srank = 1;
 
 CREATE VIEW active_energy_canonical AS
 SELECT source_name, start_date, end_date, value, unit, source_version, creation_date
