@@ -7,7 +7,12 @@ dependencies = [
     "lxml>=6.1",
     "matplotlib>=3.10",
     "numpy>=2.4",
+    # polars is the dataframe layer; pandas is still pulled in transitively by
+    # statsmodels/seaborn and is used at their boundary via .to_pandas(), which
+    # itself needs pyarrow.
+    "polars>=1.0",
     "pandas>=3.0",
+    "pyarrow>=15.0",
     "pillow>=12.2",
     "scipy>=1.17",
     "seaborn>=0.13",
