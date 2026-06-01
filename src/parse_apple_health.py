@@ -20,6 +20,54 @@ QUANTITY_TYPES: dict[str, str] = {
     "HKQuantityTypeIdentifierDietaryEnergyConsumed": "CaloriesConsumed"
 }
 
+# Canonical unit per record_type. Values are normalized to this unit at ingest
+# so the rollup views can aggregate raw `value` without mixing units, and so
+# a mid-history source switch (e.g. lb -> kg scale) introduces no artificial
+# discontinuity. To add a metric: name its canonical unit here and add a
+# conversion family below covering every unit that metric can appear in.
+CANONICAL_UNITS: dict[str, str] = {
+    "ActiveEnergyBurned": "kcal",
+    "BasalEnergyBurned": "kcal",
+    "CaloriesConsumed": "kcal",
+    "BodyMass": "kg",
+}
+
+# Multiplicative factors to the canonical unit, grouped by physical quantity.
+# Each canonical unit maps to itself with factor 1.0 (so already-canonical
+# values pass through unchanged). Apple Health commonly writes `Cal` to mean
+# kilocalories. Unit spellings are matched case-sensitively as Apple emits
+# them. Extend a family with new spellings/units as needed.
+_UNIT_FACTORS: dict[str, dict[str, float]] = {
+    "kcal": {  # energy -> kcal
+        "kcal": 1.0,
+        "Cal": 1.0,  # Apple's "Cal" == kilocalorie
+        "kJ": 0.239006,
+    },
+    "kg": {  # mass -> kg
+        "kg": 1.0,
+        "lb": 0.45359237,
+    },
+}
+
+
+def normalize_value(record_type: str, value: float, unit: str | None) -> tuple[float, str]:
+    """Convert (value, unit) to the canonical unit for record_type.
+
+    Returns (canonical_value, canonical_unit). Already-canonical values are
+    returned unchanged (factor 1.0), which keeps re-ingest idempotent. Raises
+    KeyError if record_type has no canonical unit, or ValueError if `unit` is
+    not a recognized spelling for that type -- failing loudly beats silently
+    storing a value in the wrong unit.
+    """
+    canonical_unit = CANONICAL_UNITS[record_type]
+    factors = _UNIT_FACTORS[canonical_unit]
+    if unit not in factors:
+        raise ValueError(
+            f"Unrecognized unit {unit!r} for {record_type} "
+            f"(canonical {canonical_unit}); known: {sorted(factors)}"
+        )
+    return value * factors[unit], canonical_unit
+
 
 def iter_records(
     xml_path: Path, record_types: set[str] | None = None
@@ -63,19 +111,25 @@ def load_records(
         malformed = 0
         for rec in iter_records(xml_path, set(QUANTITY_TYPES)):
             seen += 1
+            record_type = QUANTITY_TYPES[rec["type"]]
             try:
                 value = float(rec["value"])
             except (KeyError, ValueError):
                 malformed += 1
                 continue
+            # Normalize to the canonical unit before insert so stored data is
+            # unit-consistent and the UNIQUE key (which includes value+unit)
+            # stays stable across re-ingest. An unrecognized unit is a data
+            # problem we want surfaced, not silently dropped, so let it raise.
+            value, unit = normalize_value(record_type, value, rec.get("unit"))
             batch.append(
                 (
-                    QUANTITY_TYPES[rec["type"]],
+                    record_type,
                     rec.get("sourceName"),
                     rec.get("startDate"),
                     rec.get("endDate"),
                     value,
-                    rec.get("unit"),
+                    unit,
                     rec.get("sourceVersion"),
                     rec.get("creationDate"),
                 )

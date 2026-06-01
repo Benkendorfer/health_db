@@ -17,6 +17,11 @@
 -- point measurements with intra-day noise (body mass: multiple weigh-ins,
 -- some of which may be transient like post-meal). Analysis scripts should
 -- query these rather than re-deriving aggregations.
+--
+-- These aggregations assume each record_type's rows share one unit. That
+-- invariant is enforced at ingest: parse_apple_health.py normalizes every
+-- value to a canonical unit per type (kcal for energy, kg for body mass)
+-- before insert. The kcal/kg labels below are therefore guaranteed correct.
 
 -- Drop in reverse dependency order, then recreate forward.
 DROP VIEW IF EXISTS daily_body_mass_canonical;
