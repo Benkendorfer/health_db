@@ -125,21 +125,17 @@ def diagnose_missing_data(df: pd.DataFrame) -> None:
     # plt.show()
 
 
-def prepare_energy_frame(df: pd.DataFrame) -> None:
-    """Interpolate weight in place; leave unlogged intake missing.
+def prepare_energy_frame(df: pd.DataFrame) -> pd.Series:
+    """Print missing-data diagnostics; return time-interpolated weight.
 
-    Weight is needed on every day to compute basal expenditure, so its gaps are
-    filled by time interpolation. Intake is deliberately *not* imputed: unlogged
-    days are modeled in the fit (see `fit_unlogged_intake`) rather than assumed
-    equal to maintenance, which would force their energy balance to zero.
+    Basal expenditure needs a weight every day to feed the cumulative surplus,
+    so this returns a gap-filled copy for that purpose only. The original
+    df["weight"] is left untouched, so the fits use just the *observed* weigh-ins
+    as their regression target rather than fabricated interpolated points (#10).
+    Intake is deliberately not imputed: unlogged days are modeled in the fit.
     """
-    print("Diagnostics before interpolation:")
     diagnose_missing_data(df)
-
-    df["weight"] = df["weight"].interpolate(method="time")
-
-    print("\n Diagnostics after interpolation:")
-    diagnose_missing_data(df)
+    return df["weight"].interpolate(method="time")
 
 
 def bmr_mifflin_st_jeor(
@@ -167,13 +163,14 @@ def fit_unlogged_intake(df: pd.DataFrame) -> dict:
     mu = coef_B / coef_A, the implied average intake on unlogged days. This
     replaces the old assumption that unlogged days sat exactly at maintenance.
 
-    Expects columns `weight`, `A`, `B`. Returns the fitted model plus k, mu, and
-    a delta-method standard error for mu. Rows with any NaN are dropped, so
+    Expects columns `weight` (observed-only; gap days are NaN), `A`, `B`. Returns
+    the fitted model plus k, mu, and a delta-method standard error for mu. Rows
+    with any NaN are dropped, so the fit uses only real weigh-ins (#10) and
     `n_obs` flags how many days actually entered the fit.
 
     Standard errors use a Newey-West (HAC) covariance: the predictors are
-    cumulative sums and weight is interpolated, so residuals are strongly
-    autocorrelated and classical OLS errors would be far too small. The
+    cumulative sums, so residuals are strongly autocorrelated and classical OLS
+    errors would be far too small. The
     standard 4*(n/100)^(2/9) rule yields too short a bandwidth here (~4 days),
     well before the SE stabilizes, so we floor it at 30 days. This is a stopgap:
     because the regressors are non-stationary cumulative sums, even HAC errors
@@ -217,26 +214,30 @@ def fit_unlogged_intake_differenced(df: pd.DataFrame, period_days: int = 7) -> d
     is dwarfed by day-to-day water-weight swings, so a *daily* difference is pure
     noise (and even flips the sign of k). We therefore aggregate to
     non-overlapping `period_days` blocks -- accumulated surplus over a block
-    rises above the noise floor -- and smooth weight with a centered rolling mean
-    first to further damp measurement noise:
+    rises above the noise floor:
 
         dW_i ~ c + k*dA_i + (k*mu)*dB_i      (i indexes blocks)
 
-    dA_i is the block's net known surplus (A differenced across the block) and
-    dB_i its count of unlogged days. Non-overlapping blocks make the residuals
-    roughly independent; a small HAC bandwidth absorbs the mild autocorrelation
-    the centered smoothing leaks across block boundaries.
+    Each block is summarized by its *mean* over the block. Because the model is
+    linear, averaging both sides is consistent, and using the mean keeps weight
+    and the A/B predictors aligned to the same (mid-block) time center -- a
+    .last()/.mean() mismatch otherwise corrupts the fit. Block weight is the mean
+    of that block's *observed weigh-ins* (no interpolated days, per #10), which
+    also averages down measurement noise. Blocks with no weigh-in are dropped, so
+    a difference spans from one populated block to the next. Non-overlapping
+    blocks make residuals roughly independent; a small HAC bandwidth absorbs the
+    mild autocorrelation from shared block endpoints.
 
-    Expects columns `weight`, `A`, `B` on a daily DatetimeIndex. Returns the
-    model, k, mu, a delta-method SE for mu, n_obs, and the block-level frame.
-
-    NOTE: weight is still interpolated (#10); smoothing + block aggregation
-    blunts but does not remove that contamination.
+    Expects columns `weight` (observed, gaps allowed), `A`, `B` on a daily
+    DatetimeIndex. Returns the model, k, mu, a delta-method SE for mu, n_obs, and
+    the block-level frame.
     """
-    smooth = df["weight"].rolling(period_days, center=True, min_periods=1).mean()
-    blocks = pd.DataFrame(
-        {"weight": smooth, "A": df["A"], "B": df["B"]}
-    ).resample(f"{period_days}D").last()
+    rule = f"{period_days}D"
+    blocks = pd.DataFrame({
+        "weight": df["weight"].resample(rule).mean(),
+        "A": df["A"].resample(rule).mean(),
+        "B": df["B"].resample(rule).mean(),
+    }).dropna(subset=["weight"])
     d = pd.DataFrame({
         "dW": blocks["weight"].diff(),
         "dA": blocks["A"].diff(),
@@ -265,7 +266,15 @@ def fit_unlogged_intake_differenced(df: pd.DataFrame, period_days: int = 7) -> d
     }
 
 
-def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> None:
+def plot_intake_weight_correlations(
+    db_path, first_day: str = "2025-10-10", include_differenced: bool = False,
+) -> None:
+    """Fit and plot the unlogged-intake model from the daily views.
+
+    Reports the levels fit (`fit_unlogged_intake`) over observed weigh-ins only.
+    The block-differenced fit is experimental and data-gated -- pass
+    `include_differenced=True` to also run it (see `_plot_differenced_fit`).
+    """
     sns.set_theme(style="whitegrid")
 
     active_energy = load_daily(
@@ -298,9 +307,12 @@ def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> N
     # the frame -- the indicator drives the unlogged-intake fit below.
     filtered = base_df.loc[base_df.index >= first_day].copy()
     intake_logged = filtered["intake"].notna()
-    prepare_energy_frame(filtered)
+    # Interpolated weight feeds basal/expenditure (needed every day); filtered's
+    # own "weight" stays observed-only so the fits never treat a filled-in day as
+    # a real measurement (#10).
+    weight_interp = prepare_energy_frame(filtered)
     filtered["basal_msj"] = bmr_mifflin_st_jeor(
-        filtered["weight"], HEIGHT_CM, AGE_YR, SEX)
+        weight_interp, HEIGHT_CM, AGE_YR, SEX)
 
     # Predictors for fit_unlogged_intake (surplus convention):
     #   A = cumulative known surplus, counting unlogged-day intake as 0
@@ -311,23 +323,17 @@ def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> N
 
     fit = fit_unlogged_intake(filtered)
     model, k, mu, se_mu = fit["model"], fit["k"], fit["mu"], fit["se_mu"]
-    diff_fit = fit_unlogged_intake_differenced(filtered)
     logged_mean = base_df["intake"].dropna().mean()
 
     print(f"Days: {int(intake_logged.sum())} logged, "
           f"{int((~intake_logged).sum())} unlogged "
-          f"({fit['n_obs']} entered the fit)")
+          f"({fit['n_obs']} weigh-ins entered the fit)")
     print(f"Mean basal:  {filtered['basal'].mean():.0f} kcal/day")
     print(f"Mean MSJ basal:  {filtered['basal_msj'].mean():.0f} kcal/day")
     print(f"Mean active: {filtered['active'].mean():.0f} kcal/day")
     print(f"Mean logged intake:   {logged_mean:.0f} kcal/day")
-
-    # Compare the levels fit (non-stationary, HAC a stopgap) against the
-    # differenced fit (stationary, valid inference). See #13.
-    print("\n                        unlogged intake      energy/kg     R^2")
-    for name, f in (("levels    ", fit), ("differenced", diff_fit)):
-        print(f"  {name}   {f['mu']:>7.0f} +/- {f['se_mu']:<5.0f} kcal/day"
-              f"   {1.0 / f['k']:>6.0f} kcal/kg   {f['model'].rsquared:.3f}")
+    print(f"Est. unlogged intake: {mu:.0f} +/- {se_mu:.0f} kcal/day")
+    print(f"Energy per kg: {1.0 / k:.0f} kcal/kg (R^2 = {model.rsquared:.3f})")
 
     # Plot weight against the fitted cumulative surplus (A + mu*B): by
     # construction the model is weight ~ const + k*(A + mu*B), so the fitted
@@ -359,15 +365,32 @@ def plot_intake_weight_correlations(db_path, first_day: str = "2025-10-10") -> N
     ax.set_ylabel("Body mass (kg)")
     ax.legend(frameon=False, loc="best")
 
-    # Differenced view: per-block weight change vs the fitted block balance
-    # (dA + mu*dB). Fitted line has intercept `const` and slope `k`.
+    if include_differenced:
+        _plot_differenced_fit(filtered)
+
+
+def _plot_differenced_fit(filtered: pd.DataFrame) -> None:
+    """Experimental block-differenced fit (see fit_unlogged_intake_differenced).
+
+    Off by default: at the current weigh-in density the estimate is unstable --
+    the sign of k flips with block size -- so it is gated behind
+    `include_differenced` until more data accumulates (#16). The machinery is
+    correct; only the data is insufficient, which is why we don't report it as a
+    headline result alongside the levels fit.
+    """
+    diff_fit = fit_unlogged_intake_differenced(filtered)
     d_k, d_mu, d_se = diff_fit["k"], diff_fit["mu"], diff_fit["se_mu"]
+    print("\n[experimental] differenced fit (data-limited, unstable -- see #16):")
+    print(f"  unlogged intake {d_mu:.0f} +/- {d_se:.0f} kcal/day, "
+          f"{1.0 / d_k:.0f} kcal/kg, R^2 {diff_fit['model'].rsquared:.3f}")
+
+    # Per-block weight change vs the fitted block balance (dA + mu*dB).
     diff_df = diff_fit["frame"].assign(
         balance=lambda r: r["dA"] + d_mu * r["dB"])
     d_label = (
         f"{1.0 / d_k:.0f} kcal/kg  (k = {d_k:.2e} kg/kcal)\n"
         f"unlogged intake = {d_mu:.0f} +/- {d_se:.0f} kcal/day\n"
-        f"R² = {diff_fit['model'].rsquared:.3f}"
+        f"R² = {diff_fit['model'].rsquared:.3f}  [experimental]"
     )
 
     _, ax = plt.subplots(figsize=(8, 6))
